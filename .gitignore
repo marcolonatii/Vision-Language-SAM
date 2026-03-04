@@ -1,0 +1,6 @@
+
+# local outputs
+work_dir/
+*.pth
+__pycache__/
+*.pyc
