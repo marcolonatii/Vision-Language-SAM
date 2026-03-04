@@ -105,14 +105,14 @@ class ImageEncoderViT(nn.Module):
             ),
             LayerNorm2d(out_chans),
         )
-        '''
+        
         self.adapter = nn.Sequential(
                 nn.Conv2d(1280, 1280//64,3,1,1),
                 nn.GELU(),
                 nn.Conv2d(1280//64, 1280,3,1,1),
                 nn.GELU()
             )
-        '''
+        
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
