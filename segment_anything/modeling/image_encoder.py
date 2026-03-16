@@ -106,21 +106,35 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
         
+        #self.adapter = nn.Sequential(
+        #        nn.Conv2d(embed_dim + 144, embed_dim // 4,3,1,1),
+        #        nn.GELU(),
+        #        nn.Conv2d(embed_dim // 4, embed_dim,3,1,1), 
+        #        nn.GELU()
+        #    )
+
+        # If using dino
         self.adapter = nn.Sequential(
-                nn.Conv2d(1280, 1280//64,3,1,1),
+                nn.Conv2d(embed_dim + 50, embed_dim // 4,3,1,1),
                 nn.GELU(),
-                nn.Conv2d(1280//64, 1280,3,1,1),
+                nn.Conv2d(embed_dim // 4, embed_dim,3,1,1), 
                 nn.GELU()
             )
         
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, blip_img_adap: torch.Tensor = None) -> torch.Tensor:
         x = self.patch_embed(x)
         if self.pos_embed is not None:
             x = x + self.pos_embed
 
         for blk in self.blocks:
             x = blk(x) #[1,64,64,1280]
-            #x = x + self.adapter(x.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        if blip_img_adap is not None:
+            x_spatial = x.permute(0, 3, 1, 2) #[1,1280,64,64]
+            x_cat = torch.cat([x_spatial, blip_img_adap], dim=1) #[1,1280+144,64,64]
+            adapter_out = self.adapter(x_cat) #[1,1280,64,64]
+            x = x + adapter_out.permute(0, 2, 3, 1) #[1,64,64,1280]
+            #x = x + self.adapter(x_cat).permute(0, 2, 3, 1)
         
         x = self.neck(x.permute(0, 3, 1, 2))
 

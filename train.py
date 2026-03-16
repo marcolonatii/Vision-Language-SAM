@@ -27,6 +27,7 @@ from typing import Any, Optional, Tuple, Type
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoModel, AutoTokenizer,AutoProcessor,MambaModel,BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoImageProcessor, AutoModel
 from functools import partial
 from utils_downstream.saliency_metric import cal_mae,cal_fm,cal_sm,cal_em,cal_wfm, cal_dice, cal_iou,cal_ber,cal_acc
 
@@ -157,7 +158,35 @@ def show_box(box, ax):
     )
 
 
+def _build_transforms():
+    img_transform = transforms.Compose([
+        transforms.Resize((1024, 1024)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+    mask_transform = transforms.Compose([
+        transforms.Resize((1024, 1024), interpolation=Image.NEAREST),
+        transforms.ToTensor(),
+    ])
+    return img_transform, mask_transform
+
+
+def _load_sample(img_path, gt_path, img_transform, mask_transform):
+    img_pil = Image.open(img_path).convert('RGB')
+    gt = Image.open(gt_path).convert('L')
+    img_1024 = img_transform(img_pil)
+    gt = mask_transform(gt)
+    img_1024_ori_resized = img_pil.resize((1024, 1024), Image.BILINEAR)
+    return (
+        torch.tensor(img_1024).float(),
+        torch.tensor(gt).long(),
+        np.array(img_1024_ori_resized)
+    )
+
+
 class NpyDataset(Dataset):
+    """Legacy generic dataset: expects data_root/Imgs/*.jpg and data_root/GT/*.png."""
     def __init__(self, data_root, bbox_shift=20):
         self.data_root = data_root
         self.gt_path = join(data_root, "GT/")
@@ -166,37 +195,81 @@ class NpyDataset(Dataset):
         self.img_path_files = sorted([self.img_path + f for f in os.listdir(self.img_path) if f.endswith('.jpg')])
         self.bbox_shift = bbox_shift
         print(f"number of images: {len(self.gt_path_files)}")
-        
-        self.img_transform = transforms.Compose([
-                transforms.Resize((1024, 1024)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-        self.mask_transform = transforms.Compose([
-                transforms.Resize((1024, 1024), interpolation=Image.NEAREST),
-                transforms.ToTensor(),
-            ])
+        self.img_transform, self.mask_transform = _build_transforms()
 
     def __len__(self):
         return len(self.gt_path_files)
 
     def __getitem__(self, index):
-       
-        img_1024_ori = Image.open(self.img_path_files[index]).convert('RGB')
-        
-        gt = Image.open(self.gt_path_files[index]).convert('L')  # multiple labels [0, 1,4,5...], (256,256)
-        
-        img_1024 = self.img_transform(img_1024_ori)
-        gt = self.mask_transform(gt)
+        return _load_sample(
+            self.img_path_files[index],
+            self.gt_path_files[index],
+            self.img_transform,
+            self.mask_transform,
+        )
 
-        # ensure original image has fixed size so DataLoader can collate batches
-        img_1024_ori_resized = img_1024_ori.resize((1024, 1024), Image.BILINEAR)
 
-        return (
-            torch.tensor(img_1024).float(),
-            torch.tensor(gt).long(),
-            np.array(img_1024_ori_resized)
+class COD10KDataset(Dataset):
+    """
+    COD10K-v3 dataset.
+    split: 'Train' or 'Test'
+    Images:    <root>/<split>/Image/*.jpg
+    GT Object: <root>/<split>/GT_Object/*.png
+    """
+    def __init__(self, root, split='Train'):
+        img_dir = join(root, split, 'Image')
+        gt_dir  = join(root, split, 'GT_Object')
+        stems = sorted([
+            os.path.splitext(f)[0]
+            for f in os.listdir(img_dir) if f.endswith('.jpg')
+        ])
+        self.img_files = [join(img_dir, s + '.jpg') for s in stems]
+        self.gt_files  = [join(gt_dir,  s + '.png') for s in stems]
+        assert len(self.img_files) > 0, f"No images found in {img_dir}"
+        print(f"COD10K {split}: {len(self.img_files)} samples")
+        self.img_transform, self.mask_transform = _build_transforms()
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, index):
+        return _load_sample(
+            self.img_files[index],
+            self.gt_files[index],
+            self.img_transform,
+            self.mask_transform,
+        )
+
+
+class CAMODataset(Dataset):
+    """
+    CAMO dataset.
+    split: 'Train' or 'Test'
+    Images: <root>/Images/<split>/*.jpg
+    GTs:    <root>/GT/<stem>.png  (single GT folder shared across splits)
+    """
+    def __init__(self, root, split='Train'):
+        img_dir = join(root, 'Images', split)
+        gt_dir  = join(root, 'GT')
+        stems = sorted([
+            os.path.splitext(f)[0]
+            for f in os.listdir(img_dir) if f.endswith('.jpg')
+        ])
+        self.img_files = [join(img_dir, s + '.jpg') for s in stems]
+        self.gt_files  = [join(gt_dir,  s + '.png') for s in stems]
+        assert len(self.img_files) > 0, f"No images found in {img_dir}"
+        print(f"CAMO {split}: {len(self.img_files)} samples")
+        self.img_transform, self.mask_transform = _build_transforms()
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def __getitem__(self, index):
+        return _load_sample(
+            self.img_files[index],
+            self.gt_files[index],
+            self.img_transform,
+            self.mask_transform,
         )
 
 # %% set up parser
@@ -208,6 +281,17 @@ parser.add_argument(
     default="data/TrainDataset",
     help="path to training npy files; two subfolders: gts and imgs",
 )
+# Dataset selection
+parser.add_argument("--use_cod10k", action="store_true", default=False,
+                    help="Include COD10K-v3 training set")
+parser.add_argument("--use_camo", action="store_true", default=False,
+                    help="Include CAMO training set")
+parser.add_argument("--cod10k_path", type=str,
+                    default="/Experiments/marcol01/COD10K-v3",
+                    help="Root directory of the COD10K-v3 dataset")
+parser.add_argument("--camo_path", type=str,
+                    default="/Experiments/marcol01/CAMO",
+                    help="Root directory of the CAMO dataset")
 parser.add_argument("-task_name", type=str, default="....")
 parser.add_argument("-model_type", type=str, default="vit_h")
 parser.add_argument(
@@ -281,12 +365,14 @@ class VLSAM(nn.Module):
     def forward(self, image,text_embeddings,image_features):
 
         
-        
+        print('Original image features shape: ', image_features.shape)
         blip_img_adap = image_features.reshape(1,-1,64,64)
-        image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
+        print('blip_img_adap shape: ', blip_img_adap.shape)
+        image_embedding = self.image_encoder(image, blip_img_adap)  # (B, 256, 64, 64)
       
         mamba_text = text_embeddings.reshape(1,-1,256)
         blip_img = image_features.reshape(1,-1,256)
+        print('blip_img shape: ', blip_img.shape)
         sparse_embeddings = torch.cat((mamba_text,blip_img),dim=1)
 
    
@@ -370,10 +456,23 @@ def main():
     losses = []
     best_loss = 1e10
     best_accuracy =0
-    train_dataset = NpyDataset(args.tr_npy_path)
-    
-    test_dataset = NpyDataset('data/....')
-    
+    # Build training dataset(s)
+    train_datasets = []
+    test_datasets = []
+    if args.use_cod10k:
+        train_datasets.append(COD10KDataset(args.cod10k_path, split='Train'))
+        test_datasets.append(COD10KDataset(args.cod10k_path, split='Test'))
+    if args.use_camo:
+        train_datasets.append(CAMODataset(args.camo_path, split='Train'))
+        test_datasets.append(CAMODataset(args.camo_path, split='Test'))
+    if not train_datasets:
+        # Fall back to the legacy generic dataset
+        train_datasets.append(NpyDataset(args.tr_npy_path))
+        test_datasets.append(NpyDataset('data/TestDataset'))
+
+    from torch.utils.data import ConcatDataset
+    train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    test_dataset  = ConcatDataset(test_datasets)  if len(test_datasets)  > 1 else test_datasets[0]
 
     print("Number of training samples: ", len(train_dataset))
     train_dataloader = DataLoader(
@@ -403,6 +502,9 @@ def main():
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
         
+    dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
+    dino_backbone   = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m").to(device)
+
     processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
     vlm_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(device)
     
@@ -420,6 +522,12 @@ def main():
             image, gt2D = image.to(device), gt2D.to(device)
             img_1024_ori = img_1024_ori.to(device)
             
+            # Dino feature extraction
+            dino_inputs = dino_processor(img_1024_ori, return_tensors="pt").to(device)
+            with torch.no_grad():
+                dino_outputs = dino_backbone(**dino_inputs)
+                dino_features = dino_outputs.last_hidden_state[:,1:,:]  # (B, 64*64, 1024)
+
             ### Get sentence about the input image
             vlm_inputs = processor(img_1024_ori, return_tensors="pt").to(device)
             vlm_outputs = vlm_model.generate(**vlm_inputs,output_hidden_states=True)
@@ -430,8 +538,8 @@ def main():
             with torch.no_grad():
                mamba_outputs = mamba_model(**mamba_inputs)
                
-               vision_outputs = vlm_model.vision_model(**vlm_inputs)
-               image_features = vision_outputs.last_hidden_state[:,1:,:]
+               #vision_outputs = vlm_model.vision_model(**vlm_inputs)
+               #image_features = vision_outputs.last_hidden_state[:,1:,:]
             
             text_features = mamba_outputs.last_hidden_state
 
@@ -447,7 +555,8 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             else:
-                medsam_pred = vlsam_model(image,text_features,image_features)
+                #medsam_pred = vlsam_model(image,text_features,image_features)
+                medsam_pred = vlsam_model(image, text_features, dino_features)
                 loss = seg_loss(medsam_pred, gt2D.float()) + ce_loss(medsam_pred, gt2D.float())
                 loss.backward()
                 optimizer.step()

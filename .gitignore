@@ -4,3 +4,9 @@ work_dir/
 *.pth
 __pycache__/
 *.pyc
+checkpoints/
+vlsam_checkpoints/
+*.pt
+checkpoints/
+vlsam_checkpoints/
+*.pt
