@@ -106,20 +106,22 @@ class ImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
         
+        self.adapter = nn.Sequential(
+                nn.Conv2d(embed_dim + 144, embed_dim // 64, 3, 1, 1),
+                nn.GELU(),
+                nn.Conv2d(embed_dim // 64, embed_dim, 3, 1, 1), 
+                nn.GELU()
+            )
+
+        # If using dino
         #self.adapter = nn.Sequential(
-        #        nn.Conv2d(embed_dim + 144, embed_dim // 4,3,1,1),
+        #        nn.Conv2d(embed_dim + 50, embed_dim // 4,3,1,1),
         #        nn.GELU(),
         #        nn.Conv2d(embed_dim // 4, embed_dim,3,1,1), 
         #        nn.GELU()
         #    )
-
-        # If using dino
-        self.adapter = nn.Sequential(
-                nn.Conv2d(embed_dim + 50, embed_dim // 4,3,1,1),
-                nn.GELU(),
-                nn.Conv2d(embed_dim // 4, embed_dim,3,1,1), 
-                nn.GELU()
-            )
+        
+        print('Embed dim:', embed_dim)
         
     def forward(self, x: torch.Tensor, blip_img_adap: torch.Tensor = None) -> torch.Tensor:
         x = self.patch_embed(x)
