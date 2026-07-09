@@ -5,6 +5,7 @@ freeze prompt image encoder
 """
 
 # %% setup environment
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import os
@@ -25,20 +26,26 @@ from torchvision import transforms
 from typing import Any, Optional, Tuple
 import torch
 from transformers import AutoModel, AutoTokenizer,BertModel,AutoProcessor,MambaModel,BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoImageProcessor, AutoModel
 from utils_downstream.saliency_metric import cal_mae,cal_fm,cal_sm,cal_em,cal_wfm, cal_dice, cal_iou,cal_ber,cal_acc
 # set seeds
 torch.manual_seed(2023)
 torch.cuda.empty_cache()
 
 
-def eval_psnr(loader, model,vlm_model,processor,mamba_model,tokenizer,eval_type=None,device=None):
+def eval_psnr(loader, model,vlm_model,processor,mamba_model,tokenizer,eval_type=None,device=None,save_path=None):
     model.eval()
+
+    captions = {}   # stem -> caption string, saved to captions.json
+
+    if save_path is not None:
+        os.makedirs(save_path, exist_ok=True)
       
     pbar = tqdm(total=len(loader), leave=False, desc='val')
     
     mae,sm,em,wfm, m_dice, m_iou,ber,acc= cal_mae(),cal_sm(),cal_em(),cal_wfm(), cal_dice(), cal_iou(),cal_ber(),cal_acc()
 
-    for step, (image, gt2D,img_1024_ori,img_path) in enumerate(loader):
+    for step, (image, gt2D, img_1024_ori, img_path, has_gt) in enumerate(loader):
 
         image, gt2D = image.to(device), gt2D.to(device)
         img_1024_ori = img_1024_ori.to(device)
@@ -59,18 +66,28 @@ def eval_psnr(loader, model,vlm_model,processor,mamba_model,tokenizer,eval_type=
             image_features = vision_outputs.last_hidden_state[:,1:,:]
             
             pred = torch.sigmoid(model(image,text_features,image_features))
-            
-            res = pred.squeeze().squeeze().cpu().numpy()
-            gt = gt2D.squeeze().squeeze().cpu().numpy()
 
-            
-            mae.update(res, gt)
-            sm.update(res,gt)    
-            em.update(res,gt)
-            wfm.update(res,gt)
-            m_dice.update(res,gt)
-            m_iou.update(res,gt)
-            ber.update(res,gt)
+            # always record caption (keyed by stem relative to frames_dir)
+            rel = os.path.relpath(img_path[0], start=loader.dataset.frames_dir)
+            stem_key = os.path.splitext(rel)[0]
+            captions[stem_key] = description
+
+            if save_path is not None:
+                mask_np = (pred.squeeze().cpu().numpy() > 0.5).astype('uint8') * 255
+                out_path = os.path.join(save_path, stem_key + '.png')
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                Image.fromarray(mask_np).save(out_path)
+
+            if has_gt.item():
+                res = pred.squeeze().squeeze().cpu().numpy()
+                gt = gt2D.squeeze().squeeze().cpu().numpy()
+                mae.update(res, gt)
+                sm.update(res, gt)
+                em.update(res, gt)
+                wfm.update(res, gt)
+                m_dice.update(res, gt)
+                m_iou.update(res, gt)
+                ber.update(res, gt)
         
         if pbar is not None:
             pbar.update(1)
@@ -85,6 +102,13 @@ def eval_psnr(loader, model,vlm_model,processor,mamba_model,tokenizer,eval_type=
 
     if pbar is not None:
         pbar.close()
+
+    # Save captions alongside the predictions
+    if save_path is not None and captions:
+        captions_path = os.path.join(save_path, "captions.json")
+        with open(captions_path, "w") as f:
+            json.dump(captions, f, indent=2)
+        print(f"[info] Captions saved to {captions_path}")
 
     return sm, em, wfm, MAE
     
@@ -152,14 +176,41 @@ def show_box(box, ax):
 
 
 class NpyDataset(Dataset):
-    def __init__(self, data_root, bbox_shift=20):
-        self.data_root = data_root
-        self.gt_path = join(data_root, "GT/")
-        self.img_path = join(data_root, "Imgs/")
-        self.gt_path_files = sorted([self.gt_path + f for f in os.listdir(self.gt_path) if f.endswith('.png')])
-        self.img_path_files = sorted([self.img_path + f for f in os.listdir(self.img_path) if f.endswith('.jpg')])
+    def __init__(self, frames_dir, masks_dir, bbox_shift=20):
+        # Collect all frames recursively
+        all_frames = []
+        for root, _, files in os.walk(frames_dir):
+            for f in sorted(files):
+                if f.endswith('.jpg') or f.endswith('.png'):
+                    all_frames.append(join(root, f))
+        all_frames.sort()
+
+        # Build index of available GT masks: relative path (no ext) -> mask path
+        mask_index = {}
+        for root, _, files in os.walk(masks_dir):
+            for f in files:
+                if f.endswith('.png'):
+                    rel_subdir = os.path.relpath(root, masks_dir)
+                    stem = os.path.splitext(f)[0]
+                    # When GT is a flat folder, rel_subdir == '.' — normalise
+                    # so the key matches the frame lookup key (stem only).
+                    if rel_subdir == '.':
+                        key = stem
+                    else:
+                        key = join(rel_subdir, stem)
+                    mask_index[key] = join(root, f)
+
+        self.img_path_files = all_frames
+        self.gt_path_files  = []
+        for fp in all_frames:
+            rel = os.path.relpath(fp, frames_dir)
+            key = os.path.splitext(rel)[0]
+            self.gt_path_files.append(mask_index.get(key, None))  # None if no GT
+
+        self.frames_dir = frames_dir
         self.bbox_shift = bbox_shift
-        print(f"number of images: {len(self.gt_path_files)}")
+        n_with_gt = sum(1 for g in self.gt_path_files if g is not None)
+        print(f"total frames: {len(all_frames)}, with GT mask: {n_with_gt}")
         
         self.img_transform = transforms.Compose([
                 transforms.Resize((1024, 1024)),
@@ -177,28 +228,45 @@ class NpyDataset(Dataset):
 
     def __getitem__(self, index):
 
-        img_1024_ori = Image.open(self.img_path_files[index]).convert('RGB')        
-        gt = Image.open(self.gt_path_files[index]).convert('L')  # multiple labels [0, 1,4,5...], (256,256)
-        
+        img_1024_ori = Image.open(self.img_path_files[index]).convert('RGB')
         img_1024 = self.img_transform(img_1024_ori)
-        gt = self.mask_transform(gt)
-        
-       return (
+
+        gt_path = self.gt_path_files[index]
+        if gt_path is not None:
+            gt = self.mask_transform(Image.open(gt_path).convert('L'))
+            has_gt = torch.tensor(1)
+        else:
+            gt = torch.zeros(1, 1024, 1024)
+            has_gt = torch.tensor(0)
+
+        return (
             torch.tensor(img_1024).float(),
             torch.tensor(gt).long(),
             np.array(img_1024_ori),
-            self.img_path_files[index]
+            self.img_path_files[index],
+            has_gt,
         )
 
 
 # %% set up parser
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    "-i",
-    "--tr_npy_path",
+    "--frames_path",
     type=str,
-    default="data/TrainDataset",
-    help="path to training npy files; two subfolders: gts and imgs",
+    default="/Experiments/marcol01/frames",
+    help="path to directory containing input frames (.jpg/.png)",
+)
+parser.add_argument(
+    "--masks_path",
+    type=str,
+    default="/Experiments/marcol01/masks",
+    help="path to directory containing GT masks (.png)",
+)
+parser.add_argument(
+    "--save_path",
+    type=str,
+    default=None,
+    help="path to directory where predicted masks will be saved (optional)",
 )
 parser.add_argument("-task_name", type=str, default="MedSAM-ViT-B")
 parser.add_argument("-model_type", type=str, default="vit_h")
@@ -213,12 +281,6 @@ parser.add_argument("-pretrain_model_path", type=str, default="")
 parser.add_argument("-work_dir", type=str, default="./work_dir")
 
 parser.add_argument("--device", type=str, default="cuda:0")
-parser.add_argument(
-    "-test_path",
-    type=str,
-    default="data/TestDataset",
-    help="path to test dataset folder with Imgs/ and GT/ subfolders",
-)
 args = parser.parse_args()
 
 
@@ -248,7 +310,7 @@ class VLSAM(nn.Module):
 
     def forward(self, image,text_embeddings,image_features):
         blip_img_adap = image_features.reshape(1,-1,64,64)
-        image_embedding = self.image_encoder(image)  # (B, 256, 64, 64)
+        image_embedding = self.image_encoder(image, blip_img_adap)  # (B, 256, 64, 64)
 
         mamba_text = text_embeddings.reshape(1,-1,256)
         blip_img = image_features.reshape(1,-1,256)
@@ -286,7 +348,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device)
     vlsam_model.load_state_dict(checkpoint["model"])
     
-    test_dataset = NpyDataset(args.test_path)
+    test_dataset = NpyDataset(args.frames_path, args.masks_path)
     print("Number of test samples: ", len(test_dataset))
 
     
@@ -307,7 +369,7 @@ def main():
     
             
     result1, result2, result3, result4 = eval_psnr(test_dataloader, vlsam_model,vlm_model,processor,mamba_model,tokenizer,
-                eval_type='cod',device=device)
+                eval_type='cod',device=device,save_path=args.save_path)
     print({'Sm': result1})
     print({'Em': result2})
     print({'wFm': result3})

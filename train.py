@@ -186,19 +186,42 @@ def _load_sample(img_path, gt_path, img_transform, mask_transform):
 
 
 class NpyDataset(Dataset):
-    """Legacy generic dataset: expects data_root/Imgs/*.jpg and data_root/GT/*.png."""
-    def __init__(self, data_root, bbox_shift=20):
-        self.data_root = data_root
-        self.gt_path = join(data_root, "GT/")
-        self.img_path = join(data_root, "Imgs/")
-        self.gt_path_files = sorted([self.gt_path + f for f in os.listdir(self.gt_path) if f.endswith('.png')])
-        self.img_path_files = sorted([self.img_path + f for f in os.listdir(self.img_path) if f.endswith('.jpg')])
+    """
+    Video dataset with nested subfolders.
+    frames_root/<video>/<frame>.jpg  (all frames, e.g. 00000.jpg, 00001.jpg, ...)
+    masks_root/<video>/<mask>.png   (1 every N frames, e.g. 00000.png, 00005.png, ...)
+    Only trains on frames that have a corresponding mask (matched by stem).
+    """
+    def __init__(self, frames_root, masks_root, bbox_shift=20):
         self.bbox_shift = bbox_shift
-        print(f"number of images: {len(self.gt_path_files)}")
+        self.img_path_files = []
+        self.gt_path_files  = []
+
+        for video in sorted(os.listdir(masks_root)):
+            mask_dir = join(masks_root, video)
+            frame_dir = join(frames_root, video)
+            if not os.path.isdir(mask_dir) or not os.path.isdir(frame_dir):
+                continue
+            # Build a stem -> mask path index
+            mask_index = {
+                os.path.splitext(f)[0]: join(mask_dir, f)
+                for f in os.listdir(mask_dir) if f.endswith('.png')
+            }
+            for f in os.listdir(frame_dir):
+                if not f.endswith('.jpg'):
+                    continue
+                stem = os.path.splitext(f)[0]
+                if stem in mask_index:
+                    self.img_path_files.append(join(frame_dir, f))
+                    self.gt_path_files.append(mask_index[stem])
+
+        self.img_path_files = sorted(self.img_path_files)
+        self.gt_path_files  = sorted(self.gt_path_files)
+        print(f"NpyDataset: {len(self.img_path_files)} frame-mask pairs found")
         self.img_transform, self.mask_transform = _build_transforms()
 
     def __len__(self):
-        return len(self.gt_path_files)
+        return len(self.img_path_files)
 
     def __getitem__(self, index):
         return _load_sample(
@@ -281,6 +304,14 @@ parser.add_argument(
     default="data/TrainDataset",
     help="path to training npy files; two subfolders: gts and imgs",
 )
+parser.add_argument("--frames_path", type=str,
+                    default="/Experiments/marcol01/frames_train",
+                    help="Root with per-video subfolders of .jpg frames")
+parser.add_argument("--masks_path", type=str,
+                    default="/Experiments/marcol01/masks_train",
+                    help="Root with per-video subfolders of .png masks")
+parser.add_argument("--val_split", type=float, default=0.1,
+                    help="Fraction of training data to use as validation (default: 0.1)")
 # Dataset selection
 parser.add_argument("--use_cod10k", action="store_true", default=False,
                     help="Include COD10K-v3 training set")
@@ -363,16 +394,11 @@ class VLSAM(nn.Module):
        
 
     def forward(self, image,text_embeddings,image_features):
-
-        
-        print('Original image features shape: ', image_features.shape)
         blip_img_adap = image_features.reshape(1,-1,64,64)
-        print('blip_img_adap shape: ', blip_img_adap.shape)
         image_embedding = self.image_encoder(image, blip_img_adap)  # (B, 256, 64, 64)
       
         mamba_text = text_embeddings.reshape(1,-1,256)
         blip_img = image_features.reshape(1,-1,256)
-        print('blip_img shape: ', blip_img.shape)
         sparse_embeddings = torch.cat((mamba_text,blip_img),dim=1)
 
    
@@ -431,18 +457,19 @@ def main():
 
     encoder_params = list(vlsam_model.image_encoder.parameters())
     decoder_params = list(vlsam_model.mask_decoder.parameters())
-
+    embed_params = list(vlsam_model.pseudo_mask_embed.parameters())
     # Create parameter groups
     
     param_groups = [
     {'params': encoder_params, 'lr': args.lr * 0.1},
-    {'params': decoder_params, 'lr': args.lr}
+    {'params': decoder_params, 'lr': args.lr},
+    {'params': embed_params, 'lr': args.lr},
     ]
     optimizer = torch.optim.AdamW(
         param_groups, lr=args.lr, weight_decay=args.weight_decay
     )
     
-    lr_scheduler = CosineAnnealingLR(optimizer, 20, eta_min=1.0e-6)
+    lr_scheduler = CosineAnnealingLR(optimizer, args.num_epochs, eta_min=1.0e-6)
     print(
         "Number of image encoder and mask decoder parameters: ",
         sum(p.numel() for p in img_mask_encdec_params if p.requires_grad),
@@ -458,21 +485,22 @@ def main():
     best_accuracy =0
     # Build training dataset(s)
     train_datasets = []
-    test_datasets = []
     if args.use_cod10k:
         train_datasets.append(COD10KDataset(args.cod10k_path, split='Train'))
-        test_datasets.append(COD10KDataset(args.cod10k_path, split='Test'))
     if args.use_camo:
         train_datasets.append(CAMODataset(args.camo_path, split='Train'))
-        test_datasets.append(CAMODataset(args.camo_path, split='Test'))
     if not train_datasets:
-        # Fall back to the legacy generic dataset
-        train_datasets.append(NpyDataset(args.tr_npy_path))
-        test_datasets.append(NpyDataset('data/TestDataset'))
+        train_datasets.append(NpyDataset(args.frames_path, args.masks_path))
 
-    from torch.utils.data import ConcatDataset
-    train_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
-    test_dataset  = ConcatDataset(test_datasets)  if len(test_datasets)  > 1 else test_datasets[0]
+    from torch.utils.data import ConcatDataset, random_split
+    full_dataset = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    val_size = max(1, int(len(full_dataset) * args.val_split))
+    train_size = len(full_dataset) - val_size
+    train_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(2024)
+    )
+    print(f"Train: {len(train_dataset)} samples, Val: {len(test_dataset)} samples")
 
     print("Number of training samples: ", len(train_dataset))
     train_dataloader = DataLoader(
@@ -502,8 +530,8 @@ def main():
     if args.use_amp:
         scaler = torch.cuda.amp.GradScaler()
         
-    dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
-    dino_backbone   = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m").to(device)
+    #dino_processor = AutoImageProcessor.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m")
+    #dino_backbone   = AutoModel.from_pretrained("facebook/dinov3-vitl16-pretrain-lvd1689m").to(device)
 
     processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
     vlm_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to(device)
@@ -523,10 +551,10 @@ def main():
             img_1024_ori = img_1024_ori.to(device)
             
             # Dino feature extraction
-            dino_inputs = dino_processor(img_1024_ori, return_tensors="pt").to(device)
-            with torch.no_grad():
-                dino_outputs = dino_backbone(**dino_inputs)
-                dino_features = dino_outputs.last_hidden_state[:,1:,:]  # (B, 64*64, 1024)
+            #dino_inputs = dino_processor(img_1024_ori, return_tensors="pt").to(device)
+            #with torch.no_grad():
+            #    dino_outputs = dino_backbone(**dino_inputs)
+            #    dino_features = dino_outputs.last_hidden_state[:,1:,:]  # (B, 64*64, 1024)
 
             ### Get sentence about the input image
             vlm_inputs = processor(img_1024_ori, return_tensors="pt").to(device)
@@ -538,15 +566,15 @@ def main():
             with torch.no_grad():
                mamba_outputs = mamba_model(**mamba_inputs)
                
-               #vision_outputs = vlm_model.vision_model(**vlm_inputs)
-               #image_features = vision_outputs.last_hidden_state[:,1:,:]
+               vision_outputs = vlm_model.vision_model(**vlm_inputs)
+               image_features = vision_outputs.last_hidden_state[:,1:,:]
             
             text_features = mamba_outputs.last_hidden_state
 
             if args.use_amp:
                 ## AMP
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    medsam_pred = vlsam_model(image,text_features)
+                    medsam_pred = vlsam_model(image, text_features, image_features)
                     loss = seg_loss(medsam_pred, gt2D.float()) + ce_loss(
                         medsam_pred, gt2D.float()
                     )
@@ -555,8 +583,8 @@ def main():
                 scaler.update()
                 optimizer.zero_grad()
             else:
-                #medsam_pred = vlsam_model(image,text_features,image_features)
-                medsam_pred = vlsam_model(image, text_features, dino_features)
+                medsam_pred = vlsam_model(image,text_features,image_features)
+                #medsam_pred = vlsam_model(image, text_features, dino_features)
                 loss = seg_loss(medsam_pred, gt2D.float()) + ce_loss(medsam_pred, gt2D.float())
                 loss.backward()
                 optimizer.step()
@@ -564,7 +592,8 @@ def main():
        
             epoch_loss += loss.item()
             iter_num += 1
-            lr_scheduler.step()
+        
+        lr_scheduler.step()  # step once per epoch, not per batch
         
         
         result1, result2, result3, result4 = eval_psnr(test_dataloader, vlsam_model,vlm_model,processor,mamba_model,tokenizer,
